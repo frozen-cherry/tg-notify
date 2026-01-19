@@ -26,5 +26,6 @@ env/
 Thumbs.db
 
 # Local test files
-hmstr_monitor.py
+local/
 call_test.py
+test_*.py

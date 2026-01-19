@@ -1,18 +1,19 @@
 """
-Telegram 通知机器人服务端 v2.0
-支持 HTTP API 通知 + Critical 级别电话告警
+Telegram 通知机器人服务端 v2.1
+支持 HTTP API 通知 + Critical 级别电话告警 + 命令下发
 """
 
 import os
 import asyncio
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Header, Request
+from fastapi import FastAPI, HTTPException, Header, Request, Query
 from pydantic import BaseModel
 from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import Application, CallbackQueryHandler, CommandHandler
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from twilio.rest import Client as TwilioClient
 import uvicorn
 import threading
@@ -59,7 +60,13 @@ CHANNEL_EMOJI = {
 # {alert_id: {"message": str, "time": float, "confirmed": bool, "call_task": Task}}
 pending_alerts = {}
 
-app = FastAPI(title="TG Notify Server v2.0")
+# ========== 命令系统 ==========
+# 命令存储: {target: [cmd1, cmd2, ...]}
+commands_store = defaultdict(list)
+command_id_counter = 0
+commands_lock = threading.Lock()
+
+app = FastAPI(title="TG Notify Server v2.1")
 bot = Bot(token=BOT_TOKEN)
 twilio_client = None
 
@@ -265,6 +272,85 @@ async def test_notification():
 # ========== TradingView Webhook ==========
 import json
 
+
+# ========== 命令系统端点 ==========
+
+async def handle_tg_command(update: Update, context):
+    """处理 TG 发送的命令: /target action [args...]"""
+    global command_id_counter
+    
+    text = update.message.text
+    parts = text.split()
+    
+    if len(parts) < 1:
+        return
+    
+    target = parts[0][1:]  # 去掉 /
+    action = parts[1] if len(parts) > 1 else ""
+    args = parts[2:] if len(parts) > 2 else []
+    
+    if not target or not action:
+        await update.message.reply_text("❌ 格式: /target action [args...]")
+        return
+    
+    # 存储命令
+    with commands_lock:
+        command_id_counter += 1
+        cmd = {
+            "id": command_id_counter,
+            "target": target,
+            "action": action,
+            "args": args,
+            "ts": int(time.time())
+        }
+        commands_store[target].append(cmd)
+        logger.info(f"📥 收到命令: {target} {action} {args}")
+    
+    # 回复确认
+    args_str = ' '.join(args) if args else ''
+    await update.message.reply_text(f"✓ 命令已发送: {target} {action} {args_str}")
+
+
+@app.get("/commands")
+async def get_commands(
+    target: str = Query(..., description="脚本标识"),
+    after: int = Query(0, description="只返回 id 大于此值的命令")
+):
+    """拉取命令（脚本轮询调用）"""
+    result = []
+    
+    with commands_lock:
+        # 返回匹配 target 的命令 + target=all 的命令
+        for t in [target, "all"]:
+            for cmd in commands_store.get(t, []):
+                if cmd["id"] > after:
+                    result.append({
+                        "id": cmd["id"],
+                        "action": cmd["action"],
+                        "args": cmd["args"],
+                        "ts": cmd["ts"]
+                    })
+    
+    # 按 id 排序
+    result.sort(key=lambda x: x["id"])
+    
+    return {"commands": result}
+
+
+def cleanup_old_commands():
+    """定期清理超过 1 小时的旧命令"""
+    while True:
+        time.sleep(300)  # 每 5 分钟清理一次
+        cutoff = int(time.time()) - 3600  # 1 小时前
+        with commands_lock:
+            for target in list(commands_store.keys()):
+                commands_store[target] = [c for c in commands_store[target] if c["ts"] > cutoff]
+                if not commands_store[target]:
+                    del commands_store[target]
+        logger.debug("🧹 命令清理完成")
+
+
+
 @app.post("/webhook/{secret}")
 async def tradingview_webhook(secret: str, request: Request):
     """
@@ -319,11 +405,14 @@ async def tradingview_webhook(secret: str, request: Request):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# Telegram Bot 轮询处理（用于接收按钮回调）
+# Telegram Bot 轮询处理（用于接收按钮回调 + 命令）
 def run_telegram_polling():
     """在单独线程运行 Telegram 轮询"""
     async def start_polling():
         application = Application.builder().token(BOT_TOKEN).build()
+        
+        # 命令处理（必须在 CallbackQueryHandler 之前）
+        application.add_handler(MessageHandler(filters.COMMAND, handle_tg_command))
         application.add_handler(CallbackQueryHandler(handle_callback))
         
         logger.info("🤖 Telegram Bot 轮询启动...")
@@ -347,7 +436,7 @@ if __name__ == "__main__":
         exit(1)
     
     print("=" * 60)
-    print("  TG Notify Server v2.0 - 支持电话告警")
+    print("  TG Notify Server v2.1 - 支持电话告警 + 命令下发")
     print("=" * 60)
     print(f"  Bot Token: {BOT_TOKEN[:20]}...")
     print(f"  Chat ID: {CHAT_ID}")
@@ -357,9 +446,15 @@ if __name__ == "__main__":
     print("-" * 60)
     print(f"  📡 TradingView Webhook:")
     print(f"     http://81.92.219.140/webhook/{WEBHOOK_SECRET}")
+    print(f"  📥 命令拉取:")
+    print(f"     GET /commands?target=<target>&after=0")
     print("=" * 60)
     
-    # 启动 Telegram 轮询线程（用于接收按钮回调）
+    # 启动命令清理线程
+    cleanup_thread = threading.Thread(target=cleanup_old_commands, daemon=True)
+    cleanup_thread.start()
+    
+    # 启动 Telegram 轮询线程（用于接收按钮回调 + 命令）
     telegram_thread = threading.Thread(target=run_telegram_polling, daemon=True)
     telegram_thread.start()
     
