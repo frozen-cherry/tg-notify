@@ -1,6 +1,7 @@
 """
-通知客户端工具 v2.0
+通知客户端工具 v2.1
 在任何监控脚本中 import 这个模块即可发送通知
+v2.1: notify() 新增可选 chat_id / thread_id，可发到其它频道/群组/话题
 """
 
 import os
@@ -26,11 +27,13 @@ def notify(
     title: str,
     message: str,
     channel: str = "info",
-    priority: str = "normal"
+    priority: str = "normal",
+    chat_id: str = None,
+    thread_id: int = None,
 ) -> bool:
     """
     发送通知到 TG Bot
-    
+
     Args:
         title: 通知标题
         message: 通知内容
@@ -39,19 +42,27 @@ def notify(
             - "normal": 普通通知
             - "high": 高优先级（加红点标记）
             - "critical": 紧急告警（N分钟未确认会打电话）
-    
+        chat_id: 目标频道/群组 ID 或服务端配置的别名；不填 = 默认频道（老行为不变）
+        thread_id: 话题（forum topic）ID，可选，发到群内某个话题
+
     Returns:
         bool: 是否发送成功
     """
+    payload = {
+        "channel": channel,
+        "title": title,
+        "message": message,
+        "priority": priority,
+    }
+    if chat_id is not None:
+        payload["chat_id"] = chat_id
+    if thread_id is not None:
+        payload["thread_id"] = thread_id
+
     try:
         resp = requests.post(
             f"{NOTIFY_SERVER}/notify",
-            json={
-                "channel": channel,
-                "title": title,
-                "message": message,
-                "priority": priority
-            },
+            json=payload,
             headers={"X-API-Key": API_KEY},
             timeout=10
         )
@@ -61,22 +72,43 @@ def notify(
         return False
 
 
-def notify_critical(title: str, message: str, channel: str = "alert") -> bool:
+def notify_to(
+    chat_id: str,
+    title: str,
+    message: str,
+    channel: str = "info",
+    priority: str = "normal",
+    thread_id: int = None,
+) -> bool:
+    """
+    发送通知到指定频道/群组/话题（notify(..., chat_id=...) 的快捷方式）
+
+    Args:
+        chat_id: 目标频道/群组 ID 或服务端配置的别名
+        thread_id: 话题（forum topic）ID，可选
+    """
+    return notify(title, message, channel=channel, priority=priority,
+                  chat_id=chat_id, thread_id=thread_id)
+
+
+def notify_critical(title: str, message: str, channel: str = "alert",
+                    chat_id: str = None, thread_id: int = None) -> bool:
     """
     发送紧急告警（未确认会打电话）
-    
+
     这是 notify(..., priority="critical") 的快捷方式
     """
-    return notify(title, message, channel=channel, priority="critical")
+    return notify(title, message, channel=channel, priority="critical",
+                  chat_id=chat_id, thread_id=thread_id)
 
 
 def call_now(message: str = "紧急告警，请查看") -> bool:
     """
     立即拨打电话（跳过 TG 确认）
-    
+
     Args:
         message: 电话中播报的内容
-    
+
     Returns:
         bool: 是否成功
     """
@@ -121,7 +153,7 @@ if __name__ == "__main__":
     print("测试通知客户端...")
     print(f"服务器: {NOTIFY_SERVER}")
     print(f"API Key: {API_KEY[:10]}..." if API_KEY else "API Key: 未配置")
-    
+
     # 测试普通通知
     result = notify("测试标题", "这是一条测试消息", channel="system")
     print(f"普通通知: {'✓ 成功' if result else '✗ 失败'}")
