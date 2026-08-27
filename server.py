@@ -14,7 +14,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Header, Request, Query
 from pydantic import BaseModel
-from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import Bot, InlineKeyboardButton, InlineKeyboardMarkup, Update, LinkPreviewOptions
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, MessageHandler, filters
 from twilio.rest import Client as TwilioClient
 import uvicorn
@@ -110,6 +110,7 @@ class NotifyRequest(BaseModel):
     priority: str = "normal"  # normal / high / critical
     chat_id: str | None = None   # 目标频道/群组 ID 或别名，不填走默认频道
     thread_id: int | None = None  # 话题（forum topic）ID，可选
+    no_preview: bool = False      # True = 不展开链接缩略图（区块浏览器那种预览没用）
 
 
 def format_message(req: NotifyRequest, alert_id: str = None) -> str:
@@ -234,7 +235,8 @@ async def notify(req: NotifyRequest, x_api_key: str = Header(None)):
                 text=text,
                 parse_mode="HTML",
                 reply_markup=reply_markup,
-                message_thread_id=thread_id
+                message_thread_id=thread_id,
+                link_preview_options=LinkPreviewOptions(is_disabled=True) if req.no_preview else None
             )
 
             # 记录待确认告警
@@ -258,7 +260,8 @@ async def notify(req: NotifyRequest, x_api_key: str = Header(None)):
                 chat_id=target_chat,
                 text=text,
                 parse_mode="HTML",
-                message_thread_id=thread_id
+                message_thread_id=thread_id,
+                link_preview_options=LinkPreviewOptions(is_disabled=True) if req.no_preview else None
             )
             return {"status": "ok", "message": "Notification sent"}
 
