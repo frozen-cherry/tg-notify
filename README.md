@@ -10,6 +10,7 @@
 - 🆔 **一键查 ID** - 把 bot 拉进新群后发 `/id`，自动返回 chat_id / 话题 ID
 - 📞 **电话告警** - Critical 告警未确认自动打电话（Twilio）
 - 📥 **命令下发** - 在 TG 发送命令控制脚本
+- 🔘 **交互按钮** - 通知消息可带按钮，点击即向脚本下发命令（如一键停止监控）
 - 🔌 **易于集成** - import 即可使用的客户端 SDK
 
 ## 快速开始
@@ -129,6 +130,31 @@ TG 命令示例：
 - `/mybot set 100` → 触发 handle_set，args=["100"]
 - `/all ping` → 广播给所有脚本
 
+## 交互按钮
+
+通知消息可以带按钮，点击按钮 = 向命令队列下发一条命令，效果等同在 TG 手打
+`/target action`。配合上面的命令接收，就能实现"点一下按钮停掉监控脚本"：
+
+```python
+from notify_client import notify
+
+notify(
+    "ETH 价格告警", "ETH 已突破 2600",
+    channel="price",
+    buttons=[{"text": "🛑 停止监控，不再提醒", "target": "eth_watch", "action": "stop"}],
+)
+```
+
+脚本侧用 `CommandListener(target="eth_watch")` 注册 `stop` 处理器即可（见上节）。
+
+说明：
+
+- 按钮点击后会从消息上移除（防重复点），并回复"✓ 命令已下发"
+- 一条消息可带多个按钮，每个按钮一行；critical 消息的"取消电话"确认按钮不受影响
+- `target` / `action` / `args` 拼接后须 ≤ 64 字节（Telegram callback_data 限制），超限返回 400
+- 命令在服务端内存中保留 1 小时，脚本轮询间隔应明显小于 1 小时；
+  需要"永久停止"的语义，脚本收到 stop 后应自己落盘一个 flag 再退出
+
 ## API
 
 ### POST /notify
@@ -152,6 +178,8 @@ curl -X POST http://localhost:8000/notify \
 | `priority`  | 否   | `normal` / `high` / `critical`，默认 `normal`     |
 | `chat_id`   | 否   | 目标频道/群组 ID 或 `TG_CHATS` 别名；不填走默认频道 |
 | `thread_id` | 否   | forum 话题 ID，发到群里的某个话题                 |
+| `no_preview`| 否   | `true` = 不展开消息内链接的预览缩略图             |
+| `buttons`   | 否   | 交互按钮列表 `[{text, target, action, args?}]`，点击即下发命令（见"交互按钮"） |
 
 ### GET /commands
 

@@ -1,7 +1,8 @@
 """
-Telegram 通知机器人服务端 v2.2
+Telegram 通知机器人服务端 v2.3
 支持 HTTP API 通知 + Critical 级别电话告警 + 命令下发
 v2.2: 支持多频道/群组/话题目标 + /id 命令查询频道 ID
+v2.3: /notify 支持 buttons —— 消息带交互按钮，点击即向命令队列下发命令
 """
 
 import os
@@ -77,7 +78,7 @@ commands_store = defaultdict(list)
 command_id_counter = 0
 commands_lock = threading.Lock()
 
-app = FastAPI(title="TG Notify Server v2.2")
+app = FastAPI(title="TG Notify Server v2.3")
 bot = Bot(token=BOT_TOKEN)
 twilio_client = None
 
@@ -103,6 +104,13 @@ def resolve_target(chat_id=None):
     return key
 
 
+class NotifyButton(BaseModel):
+    text: str        # 按钮显示文字
+    target: str      # 命令目标（脚本标识，同 /commands?target=）
+    action: str      # 命令动作，如 stop
+    args: list[str] = []  # 可选参数
+
+
 class NotifyRequest(BaseModel):
     channel: str = "info"
     title: str
@@ -111,6 +119,40 @@ class NotifyRequest(BaseModel):
     chat_id: str | None = None   # 目标频道/群组 ID 或别名，不填走默认频道
     thread_id: int | None = None  # 话题（forum topic）ID，可选
     no_preview: bool = False      # True = 不展开链接缩略图（区块浏览器那种预览没用）
+    buttons: list[NotifyButton] | None = None  # 交互按钮，点击 = 向命令队列下发 target/action
+
+
+def build_buttons_markup(buttons: list[NotifyButton] | None) -> list[list[InlineKeyboardButton]]:
+    """把 buttons 请求转成 inline keyboard 行（每个按钮一行）。
+
+    callback_data 自包含 "cmd|target|action|args"，服务重启后旧消息的按钮依然有效。
+    Telegram 限制 callback_data ≤ 64 字节，超限直接 400。
+    """
+    rows = []
+    for btn in buttons or []:
+        if not btn.target or not btn.action or "|" in btn.target or "|" in btn.action:
+            raise HTTPException(status_code=400, detail=f"Invalid button target/action: {btn.target}/{btn.action}")
+        data = f"cmd|{btn.target}|{btn.action}|{' '.join(btn.args)}"
+        if len(data.encode("utf-8")) > 64:
+            raise HTTPException(status_code=400, detail=f"Button callback data too long (>64 bytes): {data}")
+        rows.append([InlineKeyboardButton(btn.text, callback_data=data)])
+    return rows
+
+
+def enqueue_command(target: str, action: str, args: list[str]) -> int:
+    """把一条命令塞进命令队列（TG 命令和按钮回调共用），返回命令 id"""
+    global command_id_counter
+    with commands_lock:
+        command_id_counter += 1
+        commands_store[target].append({
+            "id": command_id_counter,
+            "target": target,
+            "action": action,
+            "args": args,
+            "ts": int(time.time())
+        })
+        logger.info(f"📥 收到命令: {target} {action} {args}")
+        return command_id_counter
 
 
 def format_message(req: NotifyRequest, alert_id: str = None) -> str:
@@ -212,6 +254,34 @@ async def handle_callback(update: Update, context):
         else:
             await query.message.reply_text("⚠️ 该告警已过期或已处理")
 
+    elif data.startswith("cmd|"):
+        # 消息按钮 → 命令队列（等同在 TG 手打 /target action args）
+        try:
+            _, target, action, args_str = data.split("|", 3)
+        except ValueError:
+            await query.message.reply_text("⚠️ 按钮数据格式错误")
+            return
+        args = args_str.split() if args_str else []
+        enqueue_command(target, action, args)
+
+        # 从原消息键盘里摘掉这颗已点击的按钮，其余按钮保留
+        try:
+            old_markup = query.message.reply_markup
+            remaining = [
+                row for row in (old_markup.inline_keyboard if old_markup else [])
+                if not any(b.callback_data == data for b in row)
+            ]
+            await query.edit_message_reply_markup(
+                reply_markup=InlineKeyboardMarkup(remaining) if remaining else None
+            )
+        except Exception as e:
+            logger.warning(f"按钮回调后更新键盘失败（不影响命令下发）: {e}")
+
+        await query.message.reply_text(
+            f"✓ 命令已下发: <code>{target} {action} {' '.join(args)}</code>".rstrip(),
+            parse_mode="HTML"
+        )
+
 
 @app.post("/notify")
 async def notify(req: NotifyRequest, x_api_key: str = Header(None)):
@@ -223,11 +293,12 @@ async def notify(req: NotifyRequest, x_api_key: str = Header(None)):
     thread_id = req.thread_id
     alert_id = f"{int(time.time() * 1000)}"
     text = format_message(req, alert_id)
+    button_rows = build_buttons_markup(req.buttons)  # 校验失败在发送前就 400
 
     try:
         if req.priority == "critical":
-            # Critical: 带确认按钮 + 延迟打电话
-            keyboard = [[InlineKeyboardButton("✅ 已收到，取消电话", callback_data=f"ack_{alert_id}")]]
+            # Critical: 带确认按钮 + 延迟打电话（自定义按钮排在确认按钮后面）
+            keyboard = [[InlineKeyboardButton("✅ 已收到，取消电话", callback_data=f"ack_{alert_id}")]] + button_rows
             reply_markup = InlineKeyboardMarkup(keyboard)
 
             msg = await bot.send_message(
@@ -255,11 +326,12 @@ async def notify(req: NotifyRequest, x_api_key: str = Header(None)):
             return {"status": "ok", "alert_id": alert_id, "message": "Critical notification sent, phone call scheduled"}
 
         else:
-            # Normal/High: 普通发送
+            # Normal/High: 普通发送（有 buttons 就带上键盘）
             await bot.send_message(
                 chat_id=target_chat,
                 text=text,
                 parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup(button_rows) if button_rows else None,
                 message_thread_id=thread_id,
                 link_preview_options=LinkPreviewOptions(is_disabled=True) if req.no_preview else None
             )
@@ -352,8 +424,6 @@ async def handle_id_command(update: Update, context):
 
 async def handle_tg_command(update: Update, context):
     """处理 TG 发送的命令: /target action [args...]"""
-    global command_id_counter
-
     text = update.message.text
     parts = text.split()
 
@@ -368,18 +438,7 @@ async def handle_tg_command(update: Update, context):
         await update.message.reply_text("❌ 格式: /target action [args...]")
         return
 
-    # 存储命令
-    with commands_lock:
-        command_id_counter += 1
-        cmd = {
-            "id": command_id_counter,
-            "target": target,
-            "action": action,
-            "args": args,
-            "ts": int(time.time())
-        }
-        commands_store[target].append(cmd)
-        logger.info(f"📥 收到命令: {target} {action} {args}")
+    enqueue_command(target, action, args)
 
     # 回复确认
     args_str = ' '.join(args) if args else ''
@@ -513,7 +572,7 @@ if __name__ == "__main__":
         exit(1)
 
     print("=" * 60)
-    print("  TG Notify Server v2.2 - 多频道 + 电话告警 + 命令下发")
+    print("  TG Notify Server v2.3 - 多频道 + 电话告警 + 命令下发 + 交互按钮")
     print("=" * 60)
     print(f"  Bot Token: {BOT_TOKEN[:20]}...")
     print(f"  默认 Chat ID: {CHAT_ID}")

@@ -1,7 +1,8 @@
 """
-通知客户端工具 v2.1
+通知客户端工具 v2.2
 在任何监控脚本中 import 这个模块即可发送通知
 v2.1: notify() 新增可选 chat_id / thread_id，可发到其它频道/群组/话题
+v2.2: notify() 新增可选 buttons，消息带交互按钮；配合 command_listener 接收点击
 """
 
 import os
@@ -30,6 +31,7 @@ def notify(
     priority: str = "normal",
     chat_id: str = None,
     thread_id: int = None,
+    buttons: list = None,
 ) -> bool:
     """
     发送通知到 TG Bot
@@ -44,6 +46,10 @@ def notify(
             - "critical": 紧急告警（N分钟未确认会打电话）
         chat_id: 目标频道/群组 ID 或服务端配置的别名；不填 = 默认频道（老行为不变）
         thread_id: 话题（forum topic）ID，可选，发到群内某个话题
+        buttons: 交互按钮列表，点击 = 向命令队列下发命令（脚本用
+            command_listener 或 GET /commands?target=... 接收）。
+            每个按钮: {"text": "🛑 停止", "target": "mybot", "action": "stop", "args": []}
+            注意 target/action/args 拼起来要 ≤ 64 字节（Telegram callback_data 限制）
 
     Returns:
         bool: 是否发送成功
@@ -58,6 +64,8 @@ def notify(
         payload["chat_id"] = chat_id
     if thread_id is not None:
         payload["thread_id"] = thread_id
+    if buttons:
+        payload["buttons"] = buttons
 
     try:
         resp = requests.post(
@@ -79,6 +87,7 @@ def notify_to(
     channel: str = "info",
     priority: str = "normal",
     thread_id: int = None,
+    buttons: list = None,
 ) -> bool:
     """
     发送通知到指定频道/群组/话题（notify(..., chat_id=...) 的快捷方式）
@@ -86,9 +95,10 @@ def notify_to(
     Args:
         chat_id: 目标频道/群组 ID 或服务端配置的别名
         thread_id: 话题（forum topic）ID，可选
+        buttons: 交互按钮列表，见 notify() 说明
     """
     return notify(title, message, channel=channel, priority=priority,
-                  chat_id=chat_id, thread_id=thread_id)
+                  chat_id=chat_id, thread_id=thread_id, buttons=buttons)
 
 
 def notify_critical(title: str, message: str, channel: str = "alert",
