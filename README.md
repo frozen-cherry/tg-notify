@@ -2,6 +2,9 @@
 
 通用 Telegram 通知服务，支持多级告警和命令下发。当紧急告警未在指定时间内确认时，自动拨打电话。
 
+v2.4 新增显式微信通知：`destinations=["wechat"]` 或 `["telegram", "wechat"]`。
+**未明确指定微信的调用仍只发 Telegram**。完整参数、失败处理和受限 SSH 部署说明见 [WECHAT.md](WECHAT.md)。
+
 ## 功能
 
 - 📨 **Telegram 通知** - 通过 HTTP API 发送 TG 消息

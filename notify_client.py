@@ -32,6 +32,8 @@ def notify(
     chat_id: str = None,
     thread_id: int = None,
     buttons: list = None,
+    destinations: list[str] = None,
+    request_id: str = None,
 ) -> bool:
     """
     发送通知到 TG Bot
@@ -53,6 +55,10 @@ def notify(
 
     Returns:
         bool: 是否发送成功
+
+    微信：destinations=["wechat"]，双发：["telegram", "wechat"]；默认只发 TG。
+    request_id 用业务事件 ID；它仅为微信提供幂等，不对 Telegram 去重。
+    双发 207 部分成功也返回 False；不要整包自动重试，详见 WECHAT.md。
     """
     payload = {
         "channel": channel,
@@ -66,13 +72,17 @@ def notify(
         payload["thread_id"] = thread_id
     if buttons:
         payload["buttons"] = buttons
+    if destinations is not None:
+        payload["destinations"] = destinations
+    if request_id is not None:
+        payload["request_id"] = request_id
 
     try:
         resp = requests.post(
             f"{NOTIFY_SERVER}/notify",
             json=payload,
             headers={"X-API-Key": API_KEY},
-            timeout=10
+            timeout=50 if destinations and "wechat" in destinations else 10
         )
         return resp.status_code == 200
     except Exception as e:
@@ -88,6 +98,8 @@ def notify_to(
     priority: str = "normal",
     thread_id: int = None,
     buttons: list = None,
+    destinations: list[str] = None,
+    request_id: str = None,
 ) -> bool:
     """
     发送通知到指定频道/群组/话题（notify(..., chat_id=...) 的快捷方式）
@@ -98,7 +110,8 @@ def notify_to(
         buttons: 交互按钮列表，见 notify() 说明
     """
     return notify(title, message, channel=channel, priority=priority,
-                  chat_id=chat_id, thread_id=thread_id, buttons=buttons)
+                  chat_id=chat_id, thread_id=thread_id, buttons=buttons,
+                  destinations=destinations, request_id=request_id)
 
 
 def notify_critical(title: str, message: str, channel: str = "alert",

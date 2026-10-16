@@ -21,6 +21,11 @@ from twilio.rest import Client as TwilioClient
 import uvicorn
 import threading
 import logging
+import uuid
+from typing import Literal
+from pydantic import Field
+from fastapi.responses import JSONResponse
+import wechat_transport
 
 # 加载 .env 文件
 env_path = Path(__file__).parent / ".env"
@@ -78,7 +83,7 @@ commands_store = defaultdict(list)
 command_id_counter = 0
 commands_lock = threading.Lock()
 
-app = FastAPI(title="TG Notify Server v2.3")
+app = FastAPI(title="TG Notify Server v2.4")
 bot = Bot(token=BOT_TOKEN)
 twilio_client = None
 
@@ -120,6 +125,8 @@ class NotifyRequest(BaseModel):
     thread_id: int | None = None  # 话题（forum topic）ID，可选
     no_preview: bool = False      # True = 不展开链接缩略图（区块浏览器那种预览没用）
     buttons: list[NotifyButton] | None = None  # 交互按钮，点击 = 向命令队列下发 target/action
+    destinations: list[Literal["telegram", "wechat"]] | None = Field(default=None, min_length=1, max_length=2)
+    request_id: str | None = Field(default=None, min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_.:-]+$")
 
 
 def build_buttons_markup(buttons: list[NotifyButton] | None) -> list[list[InlineKeyboardButton]]:
@@ -285,9 +292,44 @@ async def handle_callback(update: Update, context):
 
 @app.post("/notify")
 async def notify(req: NotifyRequest, x_api_key: str = Header(None)):
-    """接收通知并转发到 Telegram"""
+    """Legacy requests remain Telegram-only. WeChat requires explicit opt-in."""
     if x_api_key != API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API Key")
+    destinations = list(dict.fromkeys(req.destinations or ["telegram"]))
+    if "wechat" not in destinations:
+        return await notify_telegram(req)
+    if "telegram" not in destinations and (req.priority == "critical" or req.buttons):
+        raise HTTPException(status_code=422, detail="critical/buttons require telegram in destinations")
+    # Validate everything before any channel has side effects.
+    if "telegram" in destinations:
+        build_buttons_markup(req.buttons)
+    text = wechat_transport.render(req)
+    if len(text) > 20000:
+        raise HTTPException(status_code=422, detail="WeChat rendered text exceeds 20000 characters")
+    request_id = req.request_id or uuid.uuid4().hex
+
+    async def dispatch(destination):
+        if destination == "wechat":
+            return await wechat_transport.send(text, request_id)
+        try:
+            result = await notify_telegram(req)
+            return {"ok": True, **result}
+        except HTTPException:
+            # Do not return bot tokens, upstream URLs, or exception text.
+            return {"ok": False, "error": "telegram_failed", "outcome": "unknown"}
+
+    results = dict(zip(destinations, await asyncio.gather(*(dispatch(d) for d in destinations))))
+    for destination, result in results.items():
+        logger.info("notify delivery request_id=%s destination=%s ok=%s outcome=%s",
+                    request_id, destination, result.get("ok"), result.get("outcome", "accepted"))
+    successes = sum(result["ok"] is True for result in results.values())
+    status = "ok" if successes == len(results) else "partial" if successes else "error"
+    return JSONResponse(status_code=200 if status == "ok" else 207 if status == "partial" else 502,
+                        content={"status": status, "request_id": request_id, "results": results})
+
+
+async def notify_telegram(req: NotifyRequest):
+    """Original Telegram behavior and response contract, including phone escalation."""
 
     target_chat = resolve_target(req.chat_id)
     thread_id = req.thread_id
@@ -363,6 +405,7 @@ async def health():
         "twilio_configured": twilio_client is not None,
         "pending_alerts": len(pending_alerts),
         "chat_aliases": list(CHAT_ALIASES.keys()),
+        "wechat_configured": wechat_transport.configured(),
     }
 
 
@@ -572,7 +615,7 @@ if __name__ == "__main__":
         exit(1)
 
     print("=" * 60)
-    print("  TG Notify Server v2.3 - 多频道 + 电话告警 + 命令下发 + 交互按钮")
+    print("  TG Notify Server v2.4 - 多频道 + 电话告警 + 命令下发 + 显式微信通知")
     print("=" * 60)
     print(f"  Bot Token: {BOT_TOKEN[:20]}...")
     print(f"  默认 Chat ID: {CHAT_ID}")

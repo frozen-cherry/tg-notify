@@ -1,5 +1,10 @@
 # TG Notify 集成指南
 
+## 通知渠道（v2.4）
+
+默认和所有旧脚本仍只发 Telegram。微信必须显式传 `destinations=["wechat"]`，双发传 `["telegram", "wechat"]`；
+`channel` 仍是消息分类，不是发送渠道。新脚本接微信前必须阅读 [WECHAT.md](WECHAT.md)：包含调用示例、逐渠道回执、幂等/重试、critical/按钮限制及 agent 开发与部署规则。
+
 ## 快速开始
 
 ### 1. 复制文件
